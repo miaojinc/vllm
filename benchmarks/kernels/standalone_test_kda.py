@@ -165,7 +165,7 @@ def _ensure_kda_importable() -> None:
     When running directly from a vllm checkout whose installed wheel pre-dates
     the KDA ops (e.g. ``vllm.third_party.flash_linear_attention`` is missing),
     this function patches ``vllm.__path__`` and related subpackage paths so
-    that the source-tree copies are discoverable without reinstalling.
+    that the source tree copies are discoverable without reinstalling.
     """
     from pathlib import Path
 
@@ -221,7 +221,8 @@ def _import_kda():
         print(
             f"ERROR: Could not import vLLM KDA ops: {exc}\n"
             "Install from the vLLM source tree that includes the KDA ops:\n"
-            "  VLLM_USE_PRECOMPILED=1 uv pip install -e /path/to/vllm",
+            "  cd /path/to/this/vllm/repo && "
+            "VLLM_USE_PRECOMPILED=1 uv pip install -e .",
             file=sys.stderr,
         )
         sys.exit(1)

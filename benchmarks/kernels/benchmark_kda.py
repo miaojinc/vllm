@@ -59,7 +59,7 @@ def _ensure_kda_importable() -> None:
     When the installed vllm wheel pre-dates the KDA ops (e.g.
     ``vllm.third_party.flash_linear_attention`` is absent), this function
     patches ``vllm.__path__`` and related subpackage paths so that the
-    source-tree copies are discoverable without reinstalling.
+    source tree copies are discoverable without reinstalling.
     """
     try:
         import vllm.third_party.flash_linear_attention  # noqa: F401
