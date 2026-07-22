@@ -159,7 +159,54 @@ def _naive_recurrent_kda(
 # ---------------------------------------------------------------------------
 
 
+def _ensure_kda_importable() -> None:
+    """Extend vllm's package search paths with the repo source tree if needed.
+
+    When running directly from a vllm checkout whose installed wheel pre-dates
+    the KDA ops (e.g. ``vllm.third_party.flash_linear_attention`` is missing),
+    this function patches ``vllm.__path__`` and related subpackage paths so
+    that the source-tree copies are discoverable without reinstalling.
+    """
+    from pathlib import Path
+
+    try:
+        # Fast path: already importable, nothing to do.
+        import vllm.third_party.flash_linear_attention  # noqa: F401
+        return
+    except ImportError:
+        pass
+
+    # This script lives at benchmarks/kernels/<name>.py; repo root is ../../
+    vllm_src = Path(__file__).resolve().parent.parent.parent / "vllm"
+    if not (vllm_src / "third_party" / "flash_linear_attention").is_dir():
+        return  # not running from a source checkout — nothing to patch
+
+    import vllm
+
+    # Expose additional vllm subpackages from the source tree (e.g.
+    # third_party, triton_utils) that may be absent from the installed wheel.
+    if str(vllm_src) not in vllm.__path__:
+        vllm.__path__.insert(0, str(vllm_src))
+
+    # Clear any negative-cache entries left by earlier failed imports so that
+    # the patched paths are used on the next attempt.
+    for key in list(sys.modules):
+        if sys.modules[key] is None and key.startswith("vllm."):
+            del sys.modules[key]
+
+    # Extend vllm.utils.__path__ so helper modules added alongside the KDA
+    # ops (e.g. math_utils) are found even when the installed wheel is older.
+    try:
+        import vllm.utils as _vu
+        utils_src = str(vllm_src / "utils")
+        if utils_src not in _vu.__path__:
+            _vu.__path__.insert(0, utils_src)
+    except ImportError:
+        pass
+
+
 def _import_kda():
+    _ensure_kda_importable()
     try:
         from vllm.third_party.flash_linear_attention.ops.kda import (
             chunk_kda,
@@ -173,7 +220,8 @@ def _import_kda():
     except ImportError as exc:
         print(
             f"ERROR: Could not import vLLM KDA ops: {exc}\n"
-            "Make sure vLLM is installed: pip install vllm",
+            "Install from the vLLM source tree that includes the KDA ops:\n"
+            "  VLLM_USE_PRECOMPILED=1 uv pip install -e /path/to/vllm",
             file=sys.stderr,
         )
         sys.exit(1)

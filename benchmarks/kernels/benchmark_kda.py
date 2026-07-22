@@ -41,11 +41,54 @@ Example – sweep over multiple batch sizes and sequence lengths:
 import argparse
 import sys
 import time
+from pathlib import Path
 from statistics import mean, median
 from typing import NamedTuple
 
 import torch
 from torch.nn.functional import logsigmoid
+
+# ---------------------------------------------------------------------------
+# Source-tree import fallback for vllm KDA ops
+# ---------------------------------------------------------------------------
+
+
+def _ensure_kda_importable() -> None:
+    """Extend vllm's package search paths with the repo source tree if needed.
+
+    When the installed vllm wheel pre-dates the KDA ops (e.g.
+    ``vllm.third_party.flash_linear_attention`` is absent), this function
+    patches ``vllm.__path__`` and related subpackage paths so that the
+    source-tree copies are discoverable without reinstalling.
+    """
+    try:
+        import vllm.third_party.flash_linear_attention  # noqa: F401
+        return
+    except ImportError:
+        pass
+
+    # This script lives at benchmarks/kernels/<name>.py; repo root is ../../
+    vllm_src = Path(__file__).resolve().parent.parent.parent / "vllm"
+    if not (vllm_src / "third_party" / "flash_linear_attention").is_dir():
+        return
+
+    import vllm
+
+    if str(vllm_src) not in vllm.__path__:
+        vllm.__path__.insert(0, str(vllm_src))
+
+    for key in list(sys.modules):
+        if sys.modules[key] is None and key.startswith("vllm."):
+            del sys.modules[key]
+
+    try:
+        import vllm.utils as _vu
+        utils_src = str(vllm_src / "utils")
+        if utils_src not in _vu.__path__:
+            _vu.__path__.insert(0, utils_src)
+    except ImportError:
+        pass
+
 
 # ---------------------------------------------------------------------------
 # Result container
@@ -375,6 +418,8 @@ def _build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
+
+    _ensure_kda_importable()
 
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
