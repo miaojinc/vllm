@@ -85,14 +85,12 @@ def _make_prefill_inputs(
     k = torch.randn_like(q)
     v = torch.randn_like(q)
     g = logsigmoid(
-        torch.randn(batch, seq_len, num_heads, head_dim, dtype=torch.float32,
-                    device=device)
+        torch.randn(batch, seq_len, num_heads, head_dim,
+                    dtype=torch.float32, device=device)
     ).to(dtype)
-    beta = torch.rand(batch, seq_len, num_heads, dtype=dtype, device=device).sigmoid()
-    # initial_state layout expected by chunk_kda: [B, H, V, K] in float32
-    # chunk_kda expects initial_state with shape [B, H, head_dim, head_dim] transposed
-    # Internally chunk_kda uses (V, K) layout (transposed); we pass (K, V) here to
-    # match the test's convention – chunk_kda transposes internally.
+    beta = torch.randn(batch, seq_len, num_heads, dtype=dtype, device=device).sigmoid()
+    # initial_state layout for chunk_kda at the call site is (K, V);
+    # bench_prefill transposes to (V, K) before passing to the kernel.
     initial_state = torch.zeros(
         batch, num_heads, head_dim, head_dim, dtype=torch.float32, device=device
     )
@@ -118,7 +116,7 @@ def _make_decode_inputs(
     g = logsigmoid(
         torch.randn(batch, 1, num_heads, head_dim, dtype=torch.float32, device=device)
     ).to(dtype)
-    beta = torch.rand(batch, 1, num_heads, dtype=dtype, device=device).sigmoid()
+    beta = torch.randn(batch, 1, num_heads, dtype=dtype, device=device).sigmoid()
     # fused_recurrent_kda expects initial_state: [B, H, K, V] float32
     initial_state = torch.zeros(
         batch, num_heads, head_dim, head_dim, dtype=torch.float32, device=device
