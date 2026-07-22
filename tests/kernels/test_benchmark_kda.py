@@ -28,11 +28,9 @@ _BM_MODULE_PATH = "benchmarks.kernels.benchmark_kda"
 
 def _import_bm() -> types.ModuleType:
     """Import the benchmark module, adding the repo root to sys.path if needed."""
-    import os
+    from pathlib import Path
 
-    repo_root = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..", "..", "..")
-    )
+    repo_root = str(Path(__file__).resolve().parents[2])
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
     return importlib.import_module(_BM_MODULE_PATH)

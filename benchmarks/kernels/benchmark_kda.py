@@ -45,7 +45,7 @@ from statistics import mean, median
 from typing import NamedTuple
 
 import torch
-import torch.nn.functional as F  # noqa: F401
+from torch.nn.functional import logsigmoid
 
 # ---------------------------------------------------------------------------
 # Result container
@@ -84,7 +84,7 @@ def _make_prefill_inputs(
     q = torch.randn(batch, seq_len, num_heads, head_dim, dtype=dtype, device=device)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
-    g = F.logsigmoid(
+    g = logsigmoid(
         torch.randn(batch, seq_len, num_heads, head_dim, dtype=torch.float32,
                     device=device)
     ).to(dtype)
@@ -115,7 +115,7 @@ def _make_decode_inputs(
     q = torch.randn(batch, 1, num_heads, head_dim, dtype=dtype, device=device)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
-    g = F.logsigmoid(
+    g = logsigmoid(
         torch.randn(batch, 1, num_heads, head_dim, dtype=torch.float32, device=device)
     ).to(dtype)
     beta = torch.rand(batch, 1, num_heads, dtype=dtype, device=device).sigmoid()
