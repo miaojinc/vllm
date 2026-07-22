@@ -13,6 +13,7 @@ Tests:
 import importlib
 import sys
 import types
+from pathlib import Path
 
 import pytest
 import torch
@@ -28,8 +29,6 @@ _BM_MODULE_PATH = "benchmarks.kernels.benchmark_kda"
 
 def _import_bm() -> types.ModuleType:
     """Import the benchmark module, adding the repo root to sys.path if needed."""
-    from pathlib import Path
-
     repo_root = str(Path(__file__).resolve().parents[2])
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)

@@ -84,7 +84,7 @@ def _make_prefill_inputs(
     q = torch.randn(batch, seq_len, num_heads, head_dim, dtype=dtype, device=device)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
-    g = logsigmoid(
+    gate = logsigmoid(
         torch.randn(batch, seq_len, num_heads, head_dim,
                     dtype=torch.float32, device=device)
     ).to(dtype)
@@ -95,9 +95,9 @@ def _make_prefill_inputs(
         batch, num_heads, head_dim, head_dim, dtype=torch.float32, device=device
     )
     # cu_seqlens: one segment per batch element
-    cu = [i * seq_len for i in range(batch + 1)]
-    cu_seqlens = torch.tensor(cu, dtype=torch.int32, device=device)
-    return dict(q=q, k=k, v=v, g=g, beta=beta,
+    cu_seqlens_list = [i * seq_len for i in range(batch + 1)]
+    cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=device)
+    return dict(q=q, k=k, v=v, g=gate, beta=beta,
                 initial_state=initial_state, cu_seqlens=cu_seqlens)
 
 
@@ -113,7 +113,7 @@ def _make_decode_inputs(
     q = torch.randn(batch, 1, num_heads, head_dim, dtype=dtype, device=device)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
-    g = logsigmoid(
+    gate = logsigmoid(
         torch.randn(batch, 1, num_heads, head_dim, dtype=torch.float32, device=device)
     ).to(dtype)
     beta = torch.randn(batch, 1, num_heads, dtype=dtype, device=device).sigmoid()
@@ -121,7 +121,7 @@ def _make_decode_inputs(
     initial_state = torch.zeros(
         batch, num_heads, head_dim, head_dim, dtype=torch.float32, device=device
     )
-    return dict(q=q, k=k, v=v, g=g, beta=beta, initial_state=initial_state)
+    return dict(q=q, k=k, v=v, g=gate, beta=beta, initial_state=initial_state)
 
 
 # ---------------------------------------------------------------------------
