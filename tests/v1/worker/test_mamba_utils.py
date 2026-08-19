@@ -18,6 +18,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, MambaSpe
 from vllm.v1.worker.mamba_utils import (
     MambaCopyBuffers,
     MambaSpecDecodeGPUContext,
+    _as_signed_int64_address,
     collect_mamba_copy_meta,
     do_mamba_copy_block,
     preprocess_mamba,
@@ -31,6 +32,19 @@ _COPY_FUNCS: tuple[MambaStateCopyFunc, ...] = (
     get_conv_copy_spec,
     get_temporal_copy_spec,
 )
+
+
+@pytest.mark.parametrize(
+    ("address", "expected"),
+    [
+        (0, 0),
+        ((1 << 63) - 1, (1 << 63) - 1),
+        (1 << 63, -(1 << 63)),
+        ((1 << 64) - 1, -1),
+    ],
+)
+def test_as_signed_int64_address(address: int, expected: int):
+    assert _as_signed_int64_address(address) == expected
 
 
 def postprocess_mamba(
