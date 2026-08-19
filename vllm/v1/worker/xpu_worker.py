@@ -20,28 +20,6 @@ from .utils import request_memory
 
 logger = init_logger(__name__)
 
-_XPU_MEMORY_INFO_FALLBACK_RESERVE = 128 * 1024 * 1024
-
-
-def _repair_xpu_memory_snapshot(snapshot: MemorySnapshot) -> None:
-    if snapshot.free_memory != 0 or snapshot.total_memory == 0:
-        return
-
-    snapshot.torch_memory = torch.accelerator.memory_reserved(snapshot.device_)
-    snapshot.free_memory = max(
-        0,
-        snapshot.total_memory
-        - snapshot.torch_memory
-        - _XPU_MEMORY_INFO_FALLBACK_RESERVE,
-    )
-    snapshot.cuda_memory = snapshot.total_memory - snapshot.free_memory
-    snapshot.non_torch_memory = snapshot.cuda_memory - snapshot.torch_memory
-    logger.warning_once(
-        "XPU memory info reported zero free memory; using a conservative "
-        "estimate of %s GiB free instead.",
-        format_gib(snapshot.free_memory),
-    )
-
 
 class XPUWorker(Worker):
     """A XPU worker class."""
@@ -138,7 +116,6 @@ class XPUWorker(Worker):
 
         # take current memory snapshot
         self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
-        _repair_xpu_memory_snapshot(init_snapshot)
         self.requested_memory = request_memory(init_snapshot, self.cache_config)
         logger.debug("worker init memory snapshot: %r", self.init_snapshot)
         logger.debug(
