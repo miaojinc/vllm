@@ -46,6 +46,19 @@ _COPY_FUNCS: tuple[MambaStateCopyFunc, ...] = (
 )
 
 
+@pytest.mark.parametrize(
+    ("address", "expected"),
+    [
+        (0, 0),
+        ((1 << 63) - 1, (1 << 63) - 1),
+        (1 << 63, -(1 << 63)),
+        ((1 << 64) - 1, -1),
+    ],
+)
+def test_as_signed_int64_address(address: int, expected: int):
+    assert _as_signed_int64_address(address) == expected
+
+
 def postprocess_mamba(
     scheduler_output: "SchedulerOutput",
     kv_cache_config: "KVCacheConfig",

@@ -34,6 +34,12 @@ def _as_signed_int64_address(address: int) -> int:
 _TEMPORAL_TILES = 16
 
 
+def _as_signed_int64_address(address: int) -> int:
+    if address >= 1 << 63:
+        return address - (1 << 64)
+    return address
+
+
 @triton.jit
 def _memcpy_u64_tiled(
     src_addr,
