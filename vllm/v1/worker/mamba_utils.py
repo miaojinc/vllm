@@ -26,10 +26,6 @@ from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
 
 logger = init_logger(__name__)
 
-
-def _as_signed_int64_address(address: int) -> int:
-    return address if address < 1 << 63 else address - (1 << 64)
-
 # 16 saturates HBM on H100/GB200 across the reqs=8..128 range in
 # microbenchmarks
 _TEMPORAL_TILES = 16
@@ -784,9 +780,7 @@ class MambaSpecDecodeGPUContext:
 
                 for state_type_idx, state in enumerate(kv_caches):
                     # Base address
-                    self.state_base_addrs[idx] = _as_signed_int64_address(
-                        state.data_ptr()
-                    )
+                    self.state_base_addrs[idx] = state.data_ptr()
 
                     # Block stride (bytes between consecutive blocks)
                     # state shape: [num_blocks, ...], stride(0) = elements per block
@@ -874,7 +868,7 @@ class MambaSpecDecodeGPUContext:
         )
         self.block_table_stride_req = int(next(iter(strides)))
         for i, bt in enumerate(block_tables):
-            self.block_table_ptrs[i] = _as_signed_int64_address(bt.data_ptr())
+            self.block_table_ptrs[i] = bt.data_ptr()
 
         self.is_initialized = True
 
