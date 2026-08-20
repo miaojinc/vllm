@@ -700,7 +700,7 @@ def main() -> int:
             sequence_length,
         )
         cache_config = CacheConfig(
-            block_size=16,
+            block_size=64,
             cache_dtype="auto",
             enable_prefix_caching=False,
             mamba_block_size=model_config.max_model_len,
