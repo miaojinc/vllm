@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import ClassVar
 
 import torch
@@ -36,6 +37,17 @@ logger = init_logger(__name__)
 # so the two cannot drift). Both are hardware dependent.
 _MIN_WORK_PER_SPLIT = 512
 _SPLIT_OCCUPANCY_MULTIPLIER = 2
+_XPU_MLA_DECODE_BACKEND_ENV = "VLLM_XPU_MLA_DECODE_BACKEND"
+
+
+def _use_deepklox_decode() -> bool:
+    backend = os.getenv(_XPU_MLA_DECODE_BACKEND_ENV, "triton").lower()
+    if backend not in ("triton", "deepklox"):
+        raise ValueError(
+            f"{_XPU_MLA_DECODE_BACKEND_ENV} must be 'triton' or 'deepklox', "
+            f"got {backend!r}"
+        )
+    return backend == "deepklox"
 
 
 def _compute_num_kv_splits(max_seq_len: int, sm_count: int) -> int:
@@ -248,6 +260,10 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata.decode is not None
 
+        if _use_deepklox_decode():
+            logger.info_once("Using DeepKlox dense MLA decode on XPU.")
+            return self._forward_mqa_deepklox(q, kv_c_and_k_pe_cache, attn_metadata)
+
         if type(q) is tuple:
             q = torch.cat(q, dim=-1)
 
@@ -320,3 +336,61 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
         )
 
         return o, lse
+
+    def _forward_mqa_deepklox(
+        self,
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: MLACommonMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if isinstance(q, tuple):
+            q = torch.cat(q, dim=-1)
+        if q.dtype != torch.bfloat16 or kv_c_and_k_pe_cache.dtype != torch.bfloat16:
+            raise ValueError("DeepKlox MLA decode requires BF16 query and KV cache")
+        if self.kv_lora_rank != 512 or self.qk_rope_head_dim != 64:
+            raise ValueError("DeepKlox MLA decode requires MLA dimensions 512+64")
+        if (
+            not attn_metadata.causal
+            or attn_metadata.num_decode_tokens != attn_metadata.num_decodes
+        ):
+            raise ValueError("DeepKlox MLA decode requires causal single-token queries")
+        if kv_c_and_k_pe_cache.size(1) % 32 != 0:
+            raise ValueError("DeepKlox MLA decode requires block size divisible by 32")
+
+        try:
+            from xattention import flash_attn_with_kvcache
+        except ImportError as error:
+            raise RuntimeError(
+                "DeepKlox MLA decode requires the xattention package"
+            ) from error
+
+        if not q.is_contiguous():
+            q = q.contiguous()
+        if not kv_c_and_k_pe_cache.is_contiguous():
+            raise ValueError("DeepKlox MLA decode requires contiguous KV cache")
+
+        q_nope = q[..., : self.kv_lora_rank]
+        q_pe = q[..., self.kv_lora_rank :]
+        kv_cache = kv_c_and_k_pe_cache.unsqueeze(2)
+        v_cache = kv_cache[..., : self.kv_lora_rank]
+        k_cache = kv_cache[..., self.kv_lora_rank :]
+        decode_metadata = attn_metadata.decode
+        query_start_loc = attn_metadata.query_start_loc[
+            : attn_metadata.num_decodes + 1
+        ]
+
+        output, lse = flash_attn_with_kvcache(
+            q_pe,
+            k_cache,
+            v_cache,
+            qv=q_nope,
+            cache_seqlens=decode_metadata.seq_lens,
+            cu_seqlens_q=query_start_loc,
+            max_seqlen_q=1,
+            max_seqlen_k=attn_metadata.max_seq_len,
+            page_table=decode_metadata.block_table,
+            softmax_scale=self.scale,
+            causal=False,
+            return_softmax_lse=True,
+        )
+        return output, lse
