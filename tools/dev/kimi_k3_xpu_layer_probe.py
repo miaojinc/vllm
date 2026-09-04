@@ -9,9 +9,15 @@ the fourth transformer layer. Activations can be synthetic or loaded from a
 steady-state, host-observed decoder-layer forward latency. Set
 ``--context-length`` to populate cache before one-token decode. Set
 ``--profile-output`` to export a trace for Perfetto.
+
+Block 0 of the block table is deliberately left unused. vLLM reserves it as
+``NULL_BLOCK_ID``, and the mamba conv / KDA state kernels silently skip any
+request whose state slot is 0 -- which previously made KDA layers report empty
+``conv_state`` / ``recurrent_state`` and produce non-prefix-invariant output.
 """
 
 import argparse
+import contextlib
 import json
 import os
 import statistics
@@ -20,7 +26,7 @@ import tempfile
 import time
 import traceback
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 
@@ -38,12 +44,19 @@ from vllm.config import CacheConfig, ModelConfig, VllmConfig, set_current_vllm_c
 from vllm.distributed import init_distributed_environment, initialize_model_parallel
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.models.kimi_k3.xpu.kda import KimiK3DeltaAttention
 from vllm.models.kimi_k3.xpu.linear import KimiDecoderLayer
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.worker.workspace import init_workspace_manager
+
+try:
+    from vllm.models.kimi_k3.xpu.kda import KimiK3DeltaAttention
+except ImportError:
+    # Branches without the XPU KDA backend only build MLA layers; keep the
+    # isinstance checks below working by matching nothing.
+    class KimiK3DeltaAttention:  # type: ignore[no-redef]
+        pass
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,7 +68,35 @@ def parse_args() -> argparse.Namespace:
         "--context-length",
         type=int,
         default=0,
-        help="Populate this many historical tokens before one-token decode.",
+        help="Populate this many historical tokens before the timed forward.",
+    )
+    parser.add_argument(
+        "--chunked-prefill",
+        action="store_true",
+        help=(
+            "Treat the timed forward as a prefill chunk that follows "
+            "--context-length already-computed tokens, instead of a decode "
+            "step. Requires --num-tokens > 1."
+        ),
+    )
+    parser.add_argument(
+        "--context-chunk-size",
+        type=int,
+        default=0,
+        help=(
+            "Populate the context in chunks of this many tokens instead of a "
+            "single forward; zero keeps the single-shot behaviour."
+        ),
+    )
+    parser.add_argument(
+        "--block-size",
+        type=int,
+        default=16,
+        help=(
+            "KV cache block size. Serving configures 64 for Kimi-K3 dense MLA, "
+            "and the DeepKlox MLA decode backend rejects anything not a "
+            "multiple of 32."
+        ),
     )
     parser.add_argument(
         "--warmup-iters",
@@ -75,6 +116,14 @@ def parse_args() -> argparse.Namespace:
         help="Write a Perfetto-compatible PyTorch profiler trace.",
     )
     parser.add_argument(
+        "--profile-memory",
+        action="store_true",
+        help=(
+            "Record allocator events in the trace; expensive and inflates the "
+            "trace badly at long sequence lengths."
+        ),
+    )
+    parser.add_argument(
         "--num-experts",
         type=int,
         help="Load only experts [0, N) for a smaller development run.",
@@ -88,6 +137,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--save-output", type=Path)
+    parser.add_argument(
+        "--save-mla-decode-output",
+        type=Path,
+        help="Save the latent MLA decode output and LSE for differential tests.",
+    )
     parser.add_argument(
         "--report",
         type=Path,
@@ -138,7 +192,13 @@ def make_common_metadata(
     context_length: int,
     block_size: int,
     device: torch.device,
+    is_prefilling: bool,
 ) -> CommonAttentionMetadata:
+    """手工构造"单请求、已算 context_length 个 token、本次算 query_length 个"的元数据。
+
+    正常这些由 scheduler / GPUModelRunner 生成，探针里只能自己搭。三种形态：纯
+    prefill（ctx=0）、chunked prefill（ctx>0 且 is_prefilling）、解码。
+    """
     sequence_length = context_length + query_length
     query_start_loc = torch.tensor(
         [0, query_length], dtype=torch.int32, device=device
@@ -159,17 +219,80 @@ def make_common_metadata(
         num_actual_tokens=query_length,
         max_query_len=query_length,
         max_seq_len=sequence_length,
+        # Block 0 is vLLM's reserved NULL_BLOCK_ID: mamba/conv kernels silently
+        # skip any request whose state slot is 0, so real blocks start at 1.
         block_table_tensor=torch.arange(
-            num_blocks, dtype=torch.int32, device=device
+            1, num_blocks + 1, dtype=torch.int32, device=device
         ).view(1, num_blocks),
         slot_mapping=torch.arange(
-            context_length,
-            sequence_length,
+            context_length + block_size,
+            sequence_length + block_size,
             dtype=torch.int64,
             device=device,
         ),
         causal=True,
+        # KDA 的 metadata builder 靠它区分真解码和 prefill 分块，chunked prefill
+        # 下 context_length>0 但仍在 prefill 中，所以不能由 context_length 推。
+        is_prefilling=torch.tensor([is_prefilling], dtype=torch.bool),
     )
+
+
+class ForwardPlan(NamedTuple):
+    """一次前向所需的元数据构建材料。"""
+
+    builder: Any
+    layer_name: str
+    common: CommonAttentionMetadata
+    offset: int
+    length: int
+
+    def build(self) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
+        """现场构建元数据。
+
+        MLA 的 prefill backend 在 build() 里把 metadata 存到 backend 自身上，后一次
+        build 会覆盖前一次，所以必须紧贴着对应的前向建，不能提前批量建好。
+        """
+        return (
+            {
+                self.layer_name: self.builder.build(
+                    common_prefix_len=0,
+                    common_attn_metadata=self.common,
+                )
+            },
+            {self.layer_name: self.common.slot_mapping},
+        )
+
+
+def build_context_steps(
+    builder: Any,
+    layer_name: str,
+    context_length: int,
+    chunk_size: int,
+    block_size: int,
+    device: torch.device,
+) -> list[ForwardPlan]:
+    """把 context 切成若干 prefill 步，chunk_size <= 0 时一步铺完。
+
+    KDA 的递归状态是逐块演进的，长 context 下一次铺完会把激活显存拉到峰值。
+    """
+    if context_length <= 0:
+        return []
+    step_size = chunk_size if chunk_size > 0 else context_length
+    steps: list[ForwardPlan] = []
+    for offset in range(0, context_length, step_size):
+        length = min(step_size, context_length - offset)
+        steps.append(
+            ForwardPlan(
+                builder=builder,
+                layer_name=layer_name,
+                common=make_common_metadata(
+                    length, offset, block_size, device, True
+                ),
+                offset=offset,
+                length=length,
+            )
+        )
+    return steps
 
 
 def bind_mla_cache_and_metadata(
@@ -178,12 +301,13 @@ def bind_mla_cache_and_metadata(
     query_length: int,
     context_length: int,
     device: torch.device,
-) -> tuple[
-    dict[str, Any],
-    dict[str, torch.Tensor],
-    dict[str, Any] | None,
-    dict[str, torch.Tensor] | None,
-]:
+    is_prefilling: bool,
+    context_chunk_size: int,
+) -> tuple[ForwardPlan, list[ForwardPlan]]:
+    """为 MLA 层分配 KV cache 并构建 attention 元数据。
+
+    返回（计时前向的计划, 铺 cache 的 prefill 步列表）。
+    """
     mla = layer.self_attn.mla_attn.mla_attn
     layer_name = mla.layer_name
     backend = mla.get_attn_backend()
@@ -194,18 +318,16 @@ def bind_mla_cache_and_metadata(
         vllm_config=vllm_config,
         device=device,
     )
-    decode_common = make_common_metadata(
+    timed_common = make_common_metadata(
         query_length,
         context_length,
         vllm_config.cache_config.block_size,
         device,
-    )
-    decode_metadata = builder.build(
-        common_prefix_len=0,
-        common_attn_metadata=decode_common,
+        is_prefilling,
     )
     sequence_length = context_length + query_length
-    num_cache_blocks = cdiv(sequence_length, cache_spec.block_size)
+    # +1 for the reserved block 0 that the block table skips
+    num_cache_blocks = cdiv(sequence_length, cache_spec.block_size) + 1
     cache_shape = backend.get_kv_cache_shape(
         num_cache_blocks,
         cache_spec.block_size,
@@ -213,27 +335,22 @@ def bind_mla_cache_and_metadata(
         cache_spec.head_size,
     )
     mla.kv_cache = torch.zeros(cache_shape, dtype=cache_spec.dtype, device=device)
-    context_metadata = None
-    context_slot_mapping = None
-    if context_length > 0:
-        context_common = make_common_metadata(
+    return (
+        ForwardPlan(
+            builder=builder,
+            layer_name=layer_name,
+            common=timed_common,
+            offset=context_length,
+            length=query_length,
+        ),
+        build_context_steps(
+            builder,
+            layer_name,
             context_length,
-            0,
+            context_chunk_size,
             vllm_config.cache_config.block_size,
             device,
-        )
-        context_metadata = {
-            layer_name: builder.build(
-                common_prefix_len=0,
-                common_attn_metadata=context_common,
-            )
-        }
-        context_slot_mapping = {layer_name: context_common.slot_mapping}
-    return (
-        {layer_name: decode_metadata},
-        {layer_name: decode_common.slot_mapping},
-        context_metadata,
-        context_slot_mapping,
+        ),
     )
 
 
@@ -243,12 +360,14 @@ def bind_kda_cache_and_metadata(
     query_length: int,
     context_length: int,
     device: torch.device,
-) -> tuple[
-    dict[str, Any],
-    dict[str, torch.Tensor],
-    dict[str, Any] | None,
-    dict[str, torch.Tensor] | None,
-]:
+    is_prefilling: bool,
+    context_chunk_size: int,
+) -> tuple[ForwardPlan, list[ForwardPlan]]:
+    """为 KDA（线性注意力）层分配状态缓存并构建元数据。
+
+    KDA 用的是 Mamba 风格的状态缓存（conv 状态 + 递归状态），走 MambaSpec 按字节数
+    分配 raw buffer，再由 bind_kv_cache 切成各个状态视图。
+    """
     kda = layer.self_attn
     if not isinstance(kda, KimiK3DeltaAttention):
         raise ProbeError("Selected layer does not use XPU KDA")
@@ -263,21 +382,19 @@ def bind_kda_cache_and_metadata(
         vllm_config=vllm_config,
         device=device,
     )
-    decode_common = make_common_metadata(
+    timed_common = make_common_metadata(
         query_length,
         context_length,
         cache_spec.block_size,
         device,
-    )
-    decode_metadata = builder.build(
-        common_prefix_len=0,
-        common_attn_metadata=decode_common,
+        is_prefilling,
     )
     sequence_length = context_length + query_length
+    # +1 for the reserved block 0 that the block table skips
     num_cache_blocks = cache_spec.max_num_blocks_per_req(
         vllm_config,
         sequence_length,
-    )
+    ) + 1
     raw_cache = torch.zeros(
         num_cache_blocks,
         1,
@@ -287,27 +404,22 @@ def bind_kda_cache_and_metadata(
         device=device,
     )
     kda.bind_kv_cache(raw_cache)
-    context_metadata = None
-    context_slot_mapping = None
-    if context_length > 0:
-        context_common = make_common_metadata(
+    return (
+        ForwardPlan(
+            builder=builder,
+            layer_name=layer_name,
+            common=timed_common,
+            offset=context_length,
+            length=query_length,
+        ),
+        build_context_steps(
+            builder,
+            layer_name,
             context_length,
-            0,
+            context_chunk_size,
             cache_spec.block_size,
             device,
-        )
-        context_metadata = {
-            layer_name: builder.build(
-                common_prefix_len=0,
-                common_attn_metadata=context_common,
-            )
-        }
-        context_slot_mapping = {layer_name: context_common.slot_mapping}
-    return (
-        {layer_name: decode_metadata},
-        {layer_name: decode_common.slot_mapping},
-        context_metadata,
-        context_slot_mapping,
+        ),
     )
 
 
@@ -317,12 +429,10 @@ def bind_attention_cache_and_metadata(
     query_length: int,
     context_length: int,
     device: torch.device,
-) -> tuple[
-    dict[str, Any],
-    dict[str, torch.Tensor],
-    dict[str, Any] | None,
-    dict[str, torch.Tensor] | None,
-]:
+    is_prefilling: bool,
+    context_chunk_size: int,
+) -> tuple[ForwardPlan, list[ForwardPlan]]:
+    """根据层的注意力类型派发到 KDA 或 MLA 的绑定逻辑。"""
     if isinstance(layer.self_attn, KimiK3DeltaAttention):
         return bind_kda_cache_and_metadata(
             layer,
@@ -330,6 +440,8 @@ def bind_attention_cache_and_metadata(
             query_length,
             context_length,
             device,
+            is_prefilling,
+            context_chunk_size,
         )
     return bind_mla_cache_and_metadata(
         layer,
@@ -337,6 +449,8 @@ def bind_attention_cache_and_metadata(
         query_length,
         context_length,
         device,
+        is_prefilling,
+        context_chunk_size,
     )
 
 
@@ -514,6 +628,7 @@ def benchmark_layer_forward(
     vllm_config: VllmConfig,
     cache_state: tuple[torch.Tensor, ...],
     context_length: int,
+    is_prefilling: bool,
     warmup_iters: int,
     benchmark_iters: int,
 ) -> dict[str, Any]:
@@ -562,7 +677,9 @@ def benchmark_layer_forward(
         "latency_p99_ms": percentile(latencies_ms, 0.99),
         "tokens_per_second_median": hidden_states.size(0) * 1000 / median_ms,
         "attention_mode": (
-            "cached_decode"
+            "chunked_prefill"
+            if context_length > 0 and is_prefilling
+            else "cached_decode"
             if context_length > 0
             else "cold_decode"
             if hidden_states.size(0) == 1
@@ -582,6 +699,46 @@ def benchmark_layer_forward(
     }
 
 
+MODULE_ANNOTATION_PREFIX = "module::"
+
+
+@contextlib.contextmanager
+def annotate_submodules(layer: KimiDecoderLayer):
+    """给每个子模块的 forward 套一层 record_function，让 trace 能按模块归因。
+
+    kernel 名区分不出 attention 投影和 MLP 的 gemm（都是同一批 GEMM kernel），
+    只有模块边界能把耗时切开。
+    """
+    handles = []
+    stack: list[Any] = []
+
+    def make_enter(name: str):
+        def enter(module: torch.nn.Module, args: Any) -> None:
+            annotation = torch.profiler.record_function(
+                f"{MODULE_ANNOTATION_PREFIX}{name}"
+            )
+            annotation.__enter__()
+            stack.append(annotation)
+
+        return enter
+
+    def leave(module: torch.nn.Module, args: Any, output: Any) -> None:
+        stack.pop().__exit__(None, None, None)
+
+    for name, module in layer.named_modules():
+        if not name:
+            continue
+        handles.append(module.register_forward_pre_hook(make_enter(name)))
+        handles.append(module.register_forward_hook(leave))
+    try:
+        yield
+    finally:
+        for handle in handles:
+            handle.remove()
+        while stack:
+            stack.pop().__exit__(None, None, None)
+
+
 def profile_layer_forward(
     layer: KimiDecoderLayer,
     positions: torch.Tensor,
@@ -593,7 +750,9 @@ def profile_layer_forward(
     vllm_config: VllmConfig,
     cache_state: tuple[torch.Tensor, ...],
     output_path: Path,
+    profile_memory: bool,
 ) -> None:
+    """采一次前向的 CPU/XPU 算子轨迹，导出 chrome trace。"""
     restore_attention_cache(layer, cache_state)
     iteration_hidden_states = hidden_states.clone()
     iteration_residual = None if residual is None else residual.clone()
@@ -613,12 +772,12 @@ def profile_layer_forward(
                     torch.profiler.ProfilerActivity.XPU,
                 ],
                 record_shapes=True,
-                profile_memory=True,
+                profile_memory=profile_memory,
                 with_stack=False,
             ) as profiler:
                 with torch.profiler.record_function(
                     "kimi_decoder_layer_forward"
-                ):
+                ), annotate_submodules(layer):
                     layer(
                         positions,
                         iteration_hidden_states,
@@ -637,6 +796,7 @@ def main() -> int:
         "status": "failed",
         "checkpoint_dir": str(args.checkpoint_dir),
         "layer_index": args.layer_index,
+        "block_size": args.block_size,
     }
     try:
         if args.layer_index < 0:
@@ -645,10 +805,22 @@ def main() -> int:
             raise ProbeError("--num-tokens must be positive")
         if args.context_length < 0:
             raise ProbeError("--context-length must be non-negative")
-        if args.context_length > 0 and args.num_tokens != 1:
+        if args.block_size < 1:
+            raise ProbeError("--block-size must be positive")
+        if args.chunked_prefill and args.num_tokens < 2:
+            raise ProbeError("--chunked-prefill requires --num-tokens > 1")
+        if args.chunked_prefill and args.context_length == 0:
+            raise ProbeError("--chunked-prefill requires --context-length > 0")
+        if (
+            not args.chunked_prefill
+            and args.context_length > 0
+            and args.num_tokens != 1
+        ):
             raise ProbeError(
-                "--context-length currently requires --num-tokens 1"
+                "Multi-token forwards with context require --chunked-prefill"
             )
+        if args.context_chunk_size < 0:
+            raise ProbeError("--context-chunk-size must be non-negative")
         if args.warmup_iters < 0 or args.benchmark_iters < 0:
             raise ProbeError("Benchmark iteration counts must be non-negative")
         raw_config = load_checkpoint_config(args.checkpoint_dir)
@@ -697,10 +869,11 @@ def main() -> int:
         model_config = make_model_config(
             source_config,
             args.checkpoint_dir,
-            sequence_length,
+            # 128 是下限，保持短序列跑法下 mamba block_size 不变
+            max(sequence_length, 128),
         )
         cache_config = CacheConfig(
-            block_size=64,
+            block_size=args.block_size,
             cache_dtype="auto",
             enable_prefix_caching=False,
             mamba_block_size=model_config.max_model_len,
@@ -713,6 +886,10 @@ def main() -> int:
         )
         with set_current_vllm_config(vllm_config):
             initialize_single_rank()
+            # WorkerBase does this at startup; without it every IR op keeps an
+            # empty priority list and silently dispatches to the decomposed
+            # native path instead of the fused vllm_c kernels.
+            vllm_config.kernel_config.ir_op_priority.set_default()
             init_workspace_manager(device)
             with default_dtype(torch.bfloat16):
                 layer = KimiDecoderLayer(
@@ -762,17 +939,37 @@ def main() -> int:
                 layer.self_attn.mla_attn.mla_attn.process_weights_after_loading(
                     torch.bfloat16
                 )
+            mla_decode_state: dict[str, torch.Tensor | None] = {}
+            if args.save_mla_decode_output is not None:
+                if is_kda:
+                    raise ProbeError(
+                        "--save-mla-decode-output requires an MLA layer"
+                    )
+                mla = layer.self_attn.mla_attn.mla_attn
+                original_forward_mqa = mla.impl.forward_mqa
+
+                def capture_forward_mqa(*call_args, **call_kwargs):
+                    latent_output, lse = original_forward_mqa(
+                        *call_args, **call_kwargs
+                    )
+                    mla_decode_state["latent_output"] = latent_output.detach().clone()
+                    mla_decode_state["lse"] = (
+                        None if lse is None else lse.detach().clone()
+                    )
+                    return latent_output, lse
+
+                mla.impl.forward_mqa = capture_forward_mqa
             (
-                metadata,
-                slot_mapping,
-                context_metadata,
-                context_slot_mapping,
+                timed_plan,
+                context_steps,
             ) = bind_attention_cache_and_metadata(
                 layer,
                 vllm_config,
                 args.num_tokens,
                 args.context_length,
                 device,
+                args.chunked_prefill,
+                args.context_chunk_size,
             )
             loaded_input_state = None
             if args.input_state is not None:
@@ -804,39 +1001,47 @@ def main() -> int:
                         state=context_input_state,
                     )
                 )
-                assert context_metadata is not None
-                assert context_slot_mapping is not None
+                assert context_steps
                 context_positions = torch.arange(
                     args.context_length,
                     dtype=torch.int64,
                     device=device,
                 )
-                with torch.inference_mode(), set_forward_context(
-                    context_metadata,
-                    vllm_config,
-                    num_tokens=args.context_length,
-                    slot_mapping=context_slot_mapping,
-                ):
-                    context_output, _, _ = layer(
-                        context_positions,
-                        context_hidden_states.clone(),
-                        (
-                            None
-                            if context_residual is None
-                            else context_residual.clone()
-                        ),
-                        (
-                            None
-                            if context_prefix_sum is None
-                            else context_prefix_sum.clone()
-                        ),
-                    )
-                torch.xpu.synchronize()
-                if not bool(torch.isfinite(context_output).all()):
-                    raise ProbeError(
-                        "Context population output contains non-finite values"
-                    )
+                # 这些前向只为把历史写进 cache，不计时也不校验数值
+                for step in context_steps:
+                    chunk = slice(step.offset, step.offset + step.length)
+                    step_metadata, step_slot_mapping = step.build()
+                    with torch.inference_mode(), set_forward_context(
+                        step_metadata,
+                        vllm_config,
+                        num_tokens=step.length,
+                        slot_mapping=step_slot_mapping,
+                    ):
+                        context_output, _, _ = layer(
+                            context_positions[chunk],
+                            context_hidden_states[chunk].clone(),
+                            (
+                                None
+                                if context_residual is None
+                                else context_residual[chunk].clone()
+                            ),
+                            (
+                                None
+                                if context_prefix_sum is None
+                                else context_prefix_sum[chunk].clone()
+                            ),
+                        )
+                    torch.xpu.synchronize()
+                    if not bool(torch.isfinite(context_output).all()):
+                        raise ProbeError(
+                            "Context population output contains non-finite values"
+                        )
                 benchmark_cache_state = capture_attention_cache(layer)
+                # The history now lives in the cache; at 32K these activations
+                # are ~470 MiB each and the timed forward never reads them.
+                del context_output, context_positions
+                del context_hidden_states, context_prefix_sum, context_residual
+                torch.xpu.empty_cache()
             else:
                 decode_input_state = loaded_input_state
                 benchmark_cache_state = capture_attention_cache(layer)
@@ -854,6 +1059,8 @@ def main() -> int:
                 device=device,
             )
             restore_attention_cache(layer, benchmark_cache_state)
+            # 必须在铺完 context 之后再建，见 ForwardPlan.build 的说明
+            metadata, slot_mapping = timed_plan.build()
             with torch.inference_mode():
                 with set_forward_context(
                     metadata,
@@ -898,6 +1105,7 @@ def main() -> int:
                     vllm_config=vllm_config,
                     cache_state=benchmark_cache_state,
                     context_length=args.context_length,
+                    is_prefilling=args.chunked_prefill,
                     warmup_iters=args.warmup_iters,
                     benchmark_iters=args.benchmark_iters,
                 )
@@ -913,10 +1121,24 @@ def main() -> int:
                     vllm_config=vllm_config,
                     cache_state=benchmark_cache_state,
                     output_path=args.profile_output,
+                    profile_memory=args.profile_memory,
                 )
             if args.save_output is not None:
                 args.save_output.parent.mkdir(parents=True, exist_ok=True)
                 torch.save(output_state, args.save_output)
+            if args.save_mla_decode_output is not None:
+                if "latent_output" not in mla_decode_state:
+                    raise ProbeError("MLA decode output was not captured")
+                args.save_mla_decode_output.parent.mkdir(
+                    parents=True, exist_ok=True
+                )
+                torch.save(
+                    {
+                        name: None if value is None else value.cpu()
+                        for name, value in mla_decode_state.items()
+                    },
+                    args.save_mla_decode_output,
+                )
             report.update(
                 status="passed",
                 ordinal_layer=args.layer_index + 1,
@@ -930,6 +1152,8 @@ def main() -> int:
                 query_length=args.num_tokens,
                 context_length=args.context_length,
                 sequence_length=sequence_length,
+                chunked_prefill=args.chunked_prefill,
+                context_population_steps=len(context_steps),
                 context_population_executed=args.context_length > 0,
                 mamba_cache_mode=vllm_config.cache_config.mamba_cache_mode,
                 output_shape=list(output.shape),
